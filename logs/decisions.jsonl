@@ -1,0 +1,1 @@
+{"timestamp":"2026-01-02T00:00:00Z","context":"PerrillaCoin setup","decision":"Separated perrilla-service into its own package.json","outcome":"Reduced coupling and avoided dependency conflicts","confidence":"high","confusion":"low"}
