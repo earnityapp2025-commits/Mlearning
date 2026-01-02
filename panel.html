@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>MLearning Control Panel</title>
+
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      background: #0b1220;
+      color: #e5e7eb;
+      margin: 0;
+      padding: 24px;
+    }
+
+    h1 {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    h2 {
+      margin-bottom: 6px;
+    }
+
+    textarea, input, select {
+      width: 100%;
+      background: #020617;
+      color: #e5e7eb;
+      border: 1px solid #1e293b;
+      border-radius: 6px;
+      padding: 10px;
+      font-family: monospace;
+      margin-top: 6px;
+    }
+
+    button {
+      background: #22c55e;
+      color: #052e16;
+      border: none;
+      padding: 10px 16px;
+      border-radius: 6px;
+      font-weight: bold;
+      cursor: pointer;
+      margin-top: 12px;
+    }
+
+    button.secondary {
+      background: #3b82f6;
+      color: #eff6ff;
+    }
+
+    pre {
+      background: #020617;
+      border: 1px solid #1e293b;
+      padding: 12px;
+      border-radius: 6px;
+      overflow-x: auto;
+    }
+
+    .section {
+      margin-top: 28px;
+    }
+
+    .hint {
+      font-size: 0.9em;
+      color: #94a3b8;
+    }
+
+    hr {
+      margin: 40px 0;
+      border-color: #1f2937;
+    }
+  </style>
+</head>
+
+<body>
+
+<h1>🧠 MLearning Control Panel</h1>
+
+<!-- =============================
+     CODE PROPOSAL
+============================== -->
+<div class="section">
+  <h2>Proposed Code</h2>
+
+  <textarea id="code" rows="14">
+// Paste the code you want MLearning to insert here
+  </textarea>
+
+  <div class="hint">
+    This code is NOT applied automatically.
+    It is reviewed and inserted only via controlled backend logic.
+  </div>
+
+  <button onclick="propose()">Prepare Proposal</button>
+</div>
+
+<!-- =============================
+     INSERT LOCATION
+============================== -->
+<div class="section">
+  <h2>Where will this be inserted?</h2>
+
+  <input id="targetFile" value="index.js" />
+
+  <textarea id="explanation" rows="5">
+This code will be inserted inside the ROUTES section of index.js.
+
+Reason:
+- Keeps Express routes discoverable
+- Avoids nesting inside handlers
+- Preserves execution order
+  </textarea>
+
+  <div class="hint">
+    MLearning never guesses insertion points.
+    You explicitly describe intent.
+  </div>
+</div>
+
+<!-- =============================
+     APPLY
+============================== -->
+<div class="section">
+  <h2>Apply Code (Controlled)</h2>
+
+  <button class="secondary" onclick="apply()">Run Dry-Run</button>
+
+  <div class="hint">
+    Dry-run only.
+    No files change unless backend approves.
+  </div>
+</div>
+
+<!-- =============================
+     OUTPUT
+============================== -->
+<div class="section">
+  <h2>Result</h2>
+  <pre id="output">Waiting for action…</pre>
+</div>
+
+<hr />
+
+  <!-- =============================
+       MLearning Suggestion
+  ============================= -->
+  <div class="section">
+    <h2>🧠 Ask MLearning</h2>
+
+    <label class="hint">Tool (ex: Supabase, Prisma, Stripe)</label>
+    <input id="suggestTool" value="Supabase" />
+
+    <label class="hint">Error message</label>
+    <textarea id="suggestMessage" rows="3">
+  400 error when querying user row
+    </textarea>
+
+    <button onclick="suggest()">Suggest Fix</button>
+
+    <pre id="suggestOutput">Waiting for MLearning…</pre>
+  </div>
+
+  <script>
+  async function suggest() {
+    const tool = document.getElementById("suggestTool").value;
+    const message = document.getElementById("suggestMessage").value;
+
+    const res = await fetch("/suggest-action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tool, message })
+    });
+
+    const data = await res.json();
+
+    document.getElementById("suggestOutput").textContent =
+      JSON.stringify(data, null, 2);
+  }
+  </script>
+
+<!-- =============================
+     LIVE LEARNING FEED
+============================== -->
+<h2>🧠 Live Learning Feed</h2>
+
+<p class="hint">
+  Real-time events MLearning is receiving from all connected apps.
+</p>
+
+<div id="learnFeed" style="
+  background:#020617;
+  border:1px solid #1f2937;
+  border-radius:8px;
+  padding:12px;
+  max-height:300px;
+  overflow:auto;
+  font-family:monospace;
+  font-size:13px;
+">
+  Loading…
+</div>
+
+<script>
+function propose() {
+  const payload = {
+    targetFile: document.getElementById("targetFile").value,
+    intent: document.getElementById("explanation").value,
+    proposedCode: document.getElementById("code").value
+  };
+
+  document.getElementById("output").textContent =
+    "Proposal prepared:\n\n" + JSON.stringify(payload, null, 2);
+}
+
+async function apply() {
+  const res = await fetch("/apply-fix", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      targetFile: document.getElementById("targetFile").value,
+      fixType: "replace_single_with_maybeSingle",
+      mode: "dry-run"
+    })
+  });
+
+  const data = await res.json();
+  document.getElementById("output").textContent =
+    JSON.stringify(data, null, 2);
+}
+
+async function refreshLearnFeed() {
+  try {
+    const res = await fetch("/learn-feed");
+    const data = await res.json();
+
+    if (!data.ok) {
+      document.getElementById("learnFeed").innerText = "Error loading feed";
+      return;
+    }
+
+    const html = data.events.map(e => `
+      <div style="padding:6px 0;border-bottom:1px solid #1f2937">
+        <strong>${e.app || "unknown"}</strong>
+        [${e.level}] ${e.tool}<br/>
+        <span style="opacity:.8">${e.message}</span><br/>
+        <small style="opacity:.5">
+          ${new Date(e.created_at).toLocaleString()}
+        </small>
+      </div>
+    `).join("");
+
+    document.getElementById("learnFeed").innerHTML =
+      html || "<em>No events yet</em>";
+
+  } catch (err) {
+    document.getElementById("learnFeed").innerText = err.message;
+  }
+}
+
+refreshLearnFeed();
+setInterval(refreshLearnFeed, 3000);
+</script>
+
+</body>
+</html>

@@ -1,0 +1,258 @@
+import express from "express";
+import { createClient } from "@supabase/supabase-js";
+import fs from "fs";
+import path from "path";
+import crypto from "crypto";
+
+const app = express();
+app.use(express.json());
+
+/* =============================
+   Supabase Client
+============================= */
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+/* =============================
+   CONFIG (GUARDRAILS)
+============================= */
+const PROPOSALS_DIR = "fix-proposals";
+const BACKUPS_DIR = "fix-backups";
+
+const FILE_ALLOWLIST = new Set(["index.js"]);
+const FIX_ALLOWLIST = new Set(["replace_single_with_maybeSingle"]);
+
+/* =============================
+   AUTO-APPLY POLICY (EXPLAIN ONLY)
+============================= */
+const AUTO_APPLY_CONFIDENCE_THRESHOLD = 0.85;
+
+function canAutoApply({ confidenceScore, autoApplicable, fixType, targetFile }) {
+  if (!autoApplicable) return false;
+  if (confidenceScore < AUTO_APPLY_CONFIDENCE_THRESHOLD) return false;
+  if (!FIX_ALLOWLIST.has(fixType)) return false;
+  if (!FILE_ALLOWLIST.has(targetFile)) return false;
+  return true;
+}
+
+/* =============================
+   HELPERS
+============================= */
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir);
+}
+
+function buildSignature(tool, message) {
+  const raw = `${tool}`.trim().toLowerCase() + "|" + `${message}`.trim().toLowerCase();
+  return crypto.createHash("sha256").update(raw).digest("hex");
+}
+
+function nowStamp() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+function backupFile(targetPath) {
+  ensureDir(BACKUPS_DIR);
+  const base = path.basename(targetPath);
+  const backupName = `${base}.${nowStamp()}.bak`;
+  const backupPath = path.join(BACKUPS_DIR, backupName);
+  fs.copyFileSync(targetPath, backupPath);
+  return { backupName, backupPath };
+}
+
+/* =============================
+   FIXERS
+============================= */
+function fix_replace_single_with_maybeSingle(original) {
+  const updated = original.replace(/\.single\(/g, ".maybeSingle(");
+  const changed = updated !== original;
+
+  return {
+    changed,
+    updated,
+    summary: changed
+      ? "Replaced .single() with .maybeSingle() to avoid 400 errors."
+      : "No .single() usage found."
+  };
+}
+
+function runFix(fixType, original) {
+  if (fixType === "replace_single_with_maybeSingle") {
+    return fix_replace_single_with_maybeSingle(original);
+  }
+  return { changed: false, updated: original, summary: "Unknown fixType" };
+}
+
+/* =============================
+   SEMANTIC DIFF
+============================= */
+function generateSemanticDiff(original, updated) {
+  const o = original.split("\n");
+  const u = updated.split("\n");
+  const diffs = [];
+
+  const max = Math.max(o.length, u.length);
+  for (let i = 0; i < max; i++) {
+    if (o[i] !== u[i]) {
+      diffs.push({
+        line: i + 1,
+        before: o[i] ?? "",
+        after: u[i] ?? ""
+      });
+    }
+  }
+  return diffs;
+}
+
+/* =============================
+   ROUTES
+============================= */
+app.get("/", (_req, res) => {
+  res.send("MLearning is alive 🧠⚡");
+});
+
+/* =============================
+   AUTO-APPLY DECISION (EXPLAIN ONLY)
+============================= */
+app.post("/auto-apply-decision", async (req, res) => {
+  const { tool, message, fixType, targetFile = "index.js" } = req.body;
+
+  if (!tool || !message || !fixType) {
+    return res.status(400).json({
+      ok: false,
+      error: "Missing tool, message, or fixType"
+    });
+  }
+
+  const signatureHash = buildSignature(tool, message);
+
+  const { data, error } = await supabase
+    .from("verified_solutions")
+    .select("*")
+    .eq("signature_hash", signatureHash)
+    .maybeSingle();
+
+  if (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+
+  if (!data) {
+    return res.json({
+      ok: true,
+      decision: "no",
+      reason: "No verified solution exists yet."
+    });
+  }
+
+  const confidenceScore = data.confidence_score ?? 0;
+  const autoApplicable = data.auto_applicable === true;
+
+  const decision = canAutoApply({
+    confidenceScore,
+    autoApplicable,
+    fixType,
+    targetFile
+  });
+
+  const reasons = [];
+  if (!autoApplicable) reasons.push("Not marked auto_applicable");
+  if (confidenceScore < AUTO_APPLY_CONFIDENCE_THRESHOLD)
+    reasons.push(`Confidence ${confidenceScore} < ${AUTO_APPLY_CONFIDENCE_THRESHOLD}`);
+  if (!FIX_ALLOWLIST.has(fixType))
+    reasons.push(`Fix '${fixType}' not allowlisted`);
+  if (!FILE_ALLOWLIST.has(targetFile))
+    reasons.push(`File '${targetFile}' not allowlisted`);
+
+  res.json({
+    ok: true,
+    decision: decision ? "yes" : "no",
+    confidenceScore,
+    autoApplicable,
+    fixType,
+    targetFile,
+    explanation: decision ? "All criteria satisfied." : reasons
+  });
+});
+
+/* =============================
+   KNOWN FIX
+============================= */
+app.get("/known-fix", async (req, res) => {
+  const { tool, message } = req.query;
+
+  if (!tool || !message) {
+    return res.status(400).json({ ok: false, error: "Missing tool or message" });
+  }
+
+  const hash = buildSignature(tool, message);
+
+  const { data, error } = await supabase
+    .from("verified_solutions")
+    .select("*")
+    .eq("signature_hash", hash)
+    .maybeSingle();
+
+  if (error) return res.status(500).json({ ok: false, error: error.message });
+  if (!data) return res.json({ ok: true, known: false });
+
+  res.json({ ok: true, known: true, solution: data });
+});
+
+/* =============================
+   APPLY FIX (CONTROLLED)
+============================= */
+app.post("/apply-fix", (req, res) => {
+  const { targetFile, fixType, mode = "dry-run" } = req.body;
+
+  if (!FILE_ALLOWLIST.has(targetFile)) {
+    return res.status(403).json({ ok: false, error: "File not allowed" });
+  }
+
+  if (!FIX_ALLOWLIST.has(fixType)) {
+    return res.status(403).json({ ok: false, error: "Fix not allowed" });
+  }
+
+  if (!["dry-run", "apply"].includes(mode)) {
+    return res.status(400).json({ ok: false, error: "Invalid mode" });
+  }
+
+  const targetPath = path.join(process.cwd(), targetFile);
+
+  if (!fs.existsSync(targetPath)) {
+    return res.status(404).json({ ok: false, error: "Target file not found" });
+  }
+
+  const original = fs.readFileSync(targetPath, "utf-8");
+  const result = runFix(fixType, original);
+
+  if (mode === "dry-run") {
+    return res.json({
+      ok: true,
+      mode,
+      changed: result.changed,
+      summary: result.summary,
+      semanticDiff: generateSemanticDiff(original, result.updated),
+      note: "Dry-run only. No files were changed."
+    });
+  }
+
+  const backup = backupFile(targetPath);
+  fs.writeFileSync(targetPath, result.updated);
+
+  res.json({
+    ok: true,
+    applied: true,
+    backup,
+    summary: result.summary
+  });
+});
+
+/* =============================
+   SERVER
+============================= */
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 MLearning running on port ${PORT}`);
+});

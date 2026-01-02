@@ -1,0 +1,261 @@
+import express from "express";
+import { createClient } from "@supabase/supabase-js";
+import fs from "fs";
+import path from "path";
+import crypto from "crypto";
+
+const app = express();
+app.use(express.json());
+
+// -----------------------------
+// Supabase client
+// -----------------------------
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+// -----------------------------
+// CONFIG (GUARDRAILS)
+// -----------------------------
+const PROPOSALS_DIR = "fix-proposals";
+const BACKUPS_DIR = "fix-backups";
+
+const FILE_ALLOWLIST = new Set(["index.js"]);
+const FIX_ALLOWLIST = new Set(["replace_single_with_maybeSingle"]);
+
+// -----------------------------
+// HELPERS
+// -----------------------------
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir);
+}
+
+function buildSignature(tool, message) {
+  const raw = tool.trim().toLowerCase() + "|" + message.trim().toLowerCase();
+  return crypto.createHash("sha256").update(raw).digest("hex");
+}
+
+function nowStamp() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+function backupFile(targetPath) {
+  ensureDir(BACKUPS_DIR);
+  const base = path.basename(targetPath);
+  const backupName = `${base}.${nowStamp()}.bak`;
+  const backupPath = path.join(BACKUPS_DIR, backupName);
+  fs.copyFileSync(targetPath, backupPath);
+  return { backupName, backupPath };
+}
+
+// -----------------------------
+// FIXERS
+// -----------------------------
+function fix_replace_single_with_maybeSingle(original) {
+  const updated = original.replace(/\.single\(/g, ".maybeSingle(");
+  const changed = updated !== original;
+
+  return {
+    changed,
+    updated,
+    summary: changed
+      ? "Replaced .single() with .maybeSingle() to avoid 400 errors."
+      : "No .single() usage found."
+  };
+}
+
+function runFix(fixType, original) {
+  if (fixType === "replace_single_with_maybeSingle") {
+    return fix_replace_single_with_maybeSingle(original);
+  }
+  return { changed: false, updated: original, summary: "Unknown fixType" };
+}
+
+// -----------------------------
+// SEMANTIC DIFF
+// -----------------------------
+function generateSemanticDiff(original, updated) {
+  const originalLines = original.split("\n");
+  const updatedLines = updated.split("\n");
+
+  const diffs = [];
+  const max = Math.max(originalLines.length, updatedLines.length);
+
+  for (let i = 0; i < max; i++) {
+    const before = originalLines[i];
+    const after = updatedLines[i];
+
+    if (before !== after) {
+      diffs.push({
+        line: i + 1,
+        before: before ?? "",
+        after: after ?? ""
+      });
+    }
+  }
+
+  return diffs;
+}
+
+// -----------------------------
+// ROUTES
+// -----------------------------
+app.get("/", (_req, res) => {
+  res.send("MLearning is alive 🧠⚡");
+});
+
+app.get("/test-learn", async (_req, res) => {
+  const { data, error } = await supabase.rpc(
+    "promote_lesson_by_summary_enum",
+    {
+      p_summary_match: ".single() causes 400 when no rows are returned",
+      p_tool_source: "Supabase",
+      p_error_message: "400 error when querying user row",
+      p_auto_applicable: false
+    }
+  );
+
+  if (error) return res.status(500).json({ ok: false, error: error.message });
+  res.json({ ok: true, record: data });
+});
+
+app.get("/known-fix", async (req, res) => {
+  const { tool, message } = req.query;
+  if (!tool || !message) {
+    return res.status(400).json({ ok: false, error: "Missing tool or message" });
+  }
+
+  const hash = buildSignature(tool, message);
+
+  const { data, error } = await supabase
+    .from("verified_solutions")
+    .select("*")
+    .eq("signature_hash", hash)
+    .maybeSingle();
+
+  if (error) return res.status(500).json({ ok: false, error: error.message });
+  if (!data) return res.json({ ok: true, known: false });
+
+  res.json({ ok: true, known: true, solution: data });
+});
+
+app.post("/learn-error", async (req, res) => {
+  const { summary, tool, message, autoApplicable = false } = req.body;
+
+  if (!summary || !tool || !message) {
+    return res.status(400).json({ ok: false, error: "Missing fields" });
+  }
+
+  const { data, error } = await supabase.rpc(
+    "promote_lesson_by_summary_enum",
+    {
+      p_summary_match: summary,
+      p_tool_source: tool,
+      p_error_message: message,
+      p_auto_applicable: autoApplicable
+    }
+  );
+
+  if (error) return res.status(500).json({ ok: false, error: error.message });
+  res.json({ ok: true, learned: true, record: data });
+});
+
+app.post("/propose-fix", async (req, res) => {
+  const { tool, message } = req.body;
+  if (!tool || !message) {
+    return res.status(400).json({ ok: false, error: "Missing tool or message" });
+  }
+
+  const hash = buildSignature(tool, message);
+
+  const { data } = await supabase
+    .from("verified_solutions")
+    .select("*")
+    .eq("signature_hash", hash)
+    .maybeSingle();
+
+  if (!data) return res.json({ ok: true, known: false });
+
+  ensureDir(PROPOSALS_DIR);
+
+  const content = `# 🔧 Fix Proposal
+
+Tool: ${tool}
+Error: ${message}
+
+Fix:
+${data.solution}
+
+Confidence: ${data.confidence_score}
+`;
+
+  const filename = `fix-${Date.now()}.md`;
+  fs.writeFileSync(path.join(PROPOSALS_DIR, filename), content);
+
+  res.json({ ok: true, file: filename });
+});
+
+app.get("/proposals", (_req, res) => {
+  ensureDir(PROPOSALS_DIR);
+  const files = fs.readdirSync(PROPOSALS_DIR).filter(f => f.endsWith(".md"));
+  res.json({ ok: true, count: files.length, files });
+});
+
+app.post("/apply-fix", (req, res) => {
+  const { targetFile, fixType, mode = "dry-run" } = req.body;
+
+  if (!FILE_ALLOWLIST.has(targetFile)) {
+    return res.status(403).json({ ok: false, error: "File not allowed" });
+  }
+
+  if (!FIX_ALLOWLIST.has(fixType)) {
+    return res.status(403).json({ ok: false, error: "Fix not allowed" });
+  }
+
+  if (mode !== "dry-run" && mode !== "apply") {
+    return res.status(400).json({ ok: false, error: "Invalid mode" });
+  }
+
+  const targetPath = path.join(process.cwd(), targetFile);
+
+  if (!fs.existsSync(targetPath)) {
+    return res.status(404).json({ ok: false, error: "Target file not found" });
+  }
+
+  const original = fs.readFileSync(targetPath, "utf-8");
+  const result = runFix(fixType, original);
+  const semanticDiff = generateSemanticDiff(original, result.updated);
+
+  const preview = {
+    ok: true,
+    mode,
+    targetFile,
+    fixType,
+    changed: result.changed,
+    summary: result.summary
+  };
+
+  if (mode === "dry-run") {
+    return res.json({
+      ...preview,
+      semanticDiff,
+      note: "Dry-run only. No files were changed."
+    });
+  }
+
+  const backup = backupFile(targetPath);
+  fs.writeFileSync(targetPath, result.updated);
+
+  res.json({
+    ...preview,
+    backup,
+    note: "Fix applied successfully."
+  });
+});
+
+// -----------------------------
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 MLearning running on ${PORT}`);
+});
