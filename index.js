@@ -12,10 +12,32 @@ app.use(express.json({ limit: "2mb" }));
 /* =============================
    SUPABASE
 ============================= */
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+let supabaseClient = null;
+
+function getSupabase() {
+  if (supabaseClient) return supabaseClient;
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) {
+    throw new Error(
+      "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set"
+    );
+  }
+  supabaseClient = createClient(url, key);
+  return supabaseClient;
+}
+
+function requireSupabase(res) {
+  try {
+    return getSupabase();
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      error: e.message || String(e)
+    });
+    return null;
+  }
+}
 
 const PANEL_TOKEN = process.env.PANEL_TOKEN || ""; // set in Replit Secrets
 
@@ -172,6 +194,7 @@ function runFix(fixType, original) {
 ============================= */
 async function tryInsert(table, payload) {
   try {
+    const supabase = getSupabase();
     const { error } = await supabase.from(table).insert(payload);
     if (error) return { ok: false, error: error.message };
     return { ok: true };
@@ -182,6 +205,7 @@ async function tryInsert(table, payload) {
 
 async function tryUpsert(table, payload, onConflict) {
   try {
+    const supabase = getSupabase();
     const { error } = await supabase.from(table).upsert(payload, { onConflict });
     if (error) return { ok: false, error: error.message };
     return { ok: true };
@@ -296,6 +320,9 @@ app.post("/learn-event", async (req, res) => {
     });
   }
 
+  const supabase = requireSupabase(res);
+  if (!supabase) return;
+
   const signatureHash = buildSignature(tool, message);
 
   // 1) learn_events (primary)
@@ -361,6 +388,9 @@ app.get("/known-fix", async (req, res) => {
     return res.status(400).json({ ok: false, error: "Missing tool or message" });
   }
 
+  const supabase = requireSupabase(res);
+  if (!supabase) return;
+
   const signatureHash = buildSignature(tool, message);
 
   const { data, error } = await supabase
@@ -387,6 +417,9 @@ app.post("/suggest-action", async (req, res) => {
       error: "Missing tool or message"
     });
   }
+
+  const supabase = requireSupabase(res);
+  if (!supabase) return;
 
   const signatureHash = buildSignature(tool, message);
 
@@ -422,6 +455,9 @@ app.post("/suggest-action", async (req, res) => {
    LIVE LEARN EVENT FEED
 ============================= */
 app.get("/learn-feed", async (_req, res) => {
+  const supabase = requireSupabase(res);
+  if (!supabase) return;
+
   const { data, error } = await supabase
     .from("learn_events")
     .select("*")
@@ -443,6 +479,9 @@ app.post("/auto-apply-decision", async (req, res) => {
   if (!tool || !message || !fixType) {
     return res.status(400).json({ ok: false, error: "Missing tool/message/fixType" });
   }
+
+  const supabase = requireSupabase(res);
+  if (!supabase) return;
 
   const signatureHash = buildSignature(tool, message);
 
@@ -672,6 +711,16 @@ app.post("/apply-proposal", async (req, res) => {
     }
 
     // prevent duplicate apply by hash (best effort)
+    let supabase;
+    try {
+      supabase = getSupabase();
+    } catch (e) {
+      return res.status(500).json({
+        ok: false,
+        error: e.message || String(e)
+      });
+    }
+
     const { data: already } = await supabase
       .from("applied_patches")
       .select("*")
@@ -718,6 +767,9 @@ app.post("/apply-proposal", async (req, res) => {
    PANEL HISTORY (pull recent proposals/patches/events)
 ============================= */
 app.get("/panel-history", async (_req, res) => {
+  const supabase = requireSupabase(res);
+  if (!supabase) return;
+
   const out = { ok: true, proposals: [], patches: [], events: [] };
 
   try {
@@ -749,47 +801,6 @@ app.get("/panel-history", async (_req, res) => {
 
   res.json(out);
 });
-/* =============================
-   SUGGEST ACTION (READ ONLY)
-============================= */
-app.post("/suggest-action", async (req, res) => {
-  const { tool, message } = req.body;
-
-  if (!tool || !message) {
-    return res.status(400).json({
-      ok: false,
-      error: "Missing tool or message"
-    });
-  }
-
-  const signatureHash = buildSignature(tool, message);
-
-  const { data, error } = await supabase
-    .from("verified_solutions")
-    .select("summary, solution, confidence_score")
-    .eq("signature_hash", signatureHash)
-    .maybeSingle();
-
-  if (error) {
-    return res.status(500).json({
-      ok: false,
-      error: error.message
-    });
-  }
-
-  if (!data) {
-    return res.json({
-      ok: true,
-      suggestion: "No known fix yet. Observe more occurrences before acting."
-    });
-  }
-
-  res.json({
-    ok: true,
-    suggestion: data.solution || data.summary,
-    confidence: data.confidence_score
-  });
-})
 
 // =============================
 // Panel auth middleware
@@ -849,36 +860,18 @@ app.post("/panel/analyze-test", requirePanelToken, async (req, res) => {
   }
 });
 
-// =============================
-// Panel: Test OpenAI analysis
-// =============================
-app.post("/panel/analyze-test", requirePanelToken, async (req, res) => {
-  try {
-    const insight = await analyzeEvent({
-      summary: "Test event from panel",
-      context: {
-        source: "panel",
-        purpose: "validate OpenAI loop",
-        timestamp: new Date().toISOString(),
-      },
-    });
-
-    res.json({
-      ok: true,
-      insight,
-    });
-  } catch (err) {
-    res.status(500).json({
-      ok: false,
-      error: err.message,
-    });
-  }
+/* =============================
+   SERVER START
+============================= */
+app.get("/panel", (_req, res) => {
+  res.sendFile(path.join(process.cwd(), "panel.html"));
 });
 
 console.log("🔎 Registered panel routes:");
 
-if (app._router && app._router.stack) {
-  app._router.stack
+const panelRouter = app.router;
+if (panelRouter && panelRouter.stack) {
+  panelRouter.stack
     .filter(r => r.route)
     .filter(r => r.route.path.startsWith("/panel"))
     .forEach(r => {
@@ -888,13 +881,6 @@ if (app._router && app._router.stack) {
 } else {
   console.log("  (no routes registered yet)");
 }
-
-/* =============================
-   SERVER START
-============================= */
-app.get("/panel", (_req, res) => {
-  res.sendFile(path.join(process.cwd(), "panel.html"));
-});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
